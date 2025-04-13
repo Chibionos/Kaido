@@ -1,0 +1,25 @@
+[project]
+name = "kaido"
+version = "0.1.0"
+description = "Natural Language Test Runner using Claude MCP"
+readme = "README.md"
+authors = [
+    { name = "Your Name", email = "your.email@example.com" }
+]
+dependencies = [
+    "anthropic>=0.40.0",
+    "mcp>=1.1.1",
+    "python-dotenv>=1.0.1",
+    "rich>=13.7.1",
+]
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+kaido = "kaido.__main__:main"
+
+[tool.hatch.metadata]
+allow-direct-references = true 
