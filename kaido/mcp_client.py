@@ -60,8 +60,80 @@ class MCPClient:
             raise RuntimeError(f"Failed to connect to Playwright MCP server: {str(e)}")
 
     async def process_query(self, query: str) -> str:
-        """Process a query using Claude and available tools."""
-        messages = [{"role": "user", "content": query}]
+        """Process a query using Claude and available tools in a ReAct style loop."""
+        system_prompt = """You are a test automation assistant that follows a ReAct (Reason + Act) approach.
+For each step, you must:
+
+1. THINK: Analyze the current state and plan the next action
+   - What is the current state?
+   - What needs to be done next?
+   - What should be verified?
+
+2. ACT: Execute the planned action using available tools
+   - Choose the appropriate tool
+   - Provide correct parameters
+   - Execute the action
+
+3. OBSERVE: Verify the results
+   - Check if the action succeeded
+   - Verify the expected state
+   - Determine if we can proceed
+
+4. REPEAT: Continue the loop until all test steps are complete
+
+Format your responses as:
+THINK: [Your analysis of the current state and next steps]
+ACT: [The action you're taking]
+OBSERVE: [Verification of results]
+NEXT: [What needs to be done next]
+
+Available browser tools:
+Navigation:
+- browser_navigate: Navigate to a URL
+- browser_navigate_back: Go back to previous page
+- browser_navigate_forward: Go forward in browser history
+
+Page Interaction:
+- browser_click: Click on an element
+- browser_type: Type text into an input field
+- browser_press_key: Press a keyboard key
+- browser_hover: Hover over an element
+- browser_drag: Drag and drop elements
+- browser_select_option: Select an option from a dropdown
+- browser_file_upload: Upload a file to the page
+
+Waiting and State:
+- browser_wait: Wait for an element to be visible/present
+- browser_snapshot: Get the current page state and DOM structure
+- browser_take_screenshot: Capture a screenshot of the page
+
+Tab Management:
+- browser_tab_new: Open a new browser tab
+- browser_tab_close: Close the current tab
+- browser_tab_list: List all open tabs
+- browser_tab_select: Switch to a specific tab
+
+Other:
+- browser_close: Close the browser
+- browser_install: Install browser dependencies
+- browser_pdf_save: Save the current page as PDF
+
+For each step:
+1. Choose the appropriate tool for the action
+2. Execute it with the correct parameters
+3. Verify the result using browser_snapshot if needed
+4. Continue to the next step immediately
+5. Do not stop until all steps are completed
+
+Important: 
+- Execute ALL steps in sequence
+- After each tool call, proceed to the next step immediately
+- Use browser_wait appropriately before interactions to ensure elements are ready
+- Verify results after important actions using browser_snapshot"""
+
+        messages = [
+            {"role": "user", "content": "Please execute the following test using the ReAct approach:\n\n" + query}
+        ]
         
         try:
             # Get available tools
@@ -72,45 +144,76 @@ class MCPClient:
                 "input_schema": tool.inputSchema
             } for tool in response.tools]
 
-            # Initial Claude API call
-            response = self.anthropic.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=1000,
-                messages=messages,
-                tools=available_tools
-            )
-            
             final_text = []
             
-            for content in response.content:
-                if content.type == 'text':
-                    final_text.append(content.text)
-                elif content.type == 'tool_use':
-                    tool_name = content.name
-                    tool_args = content.input
-                    
-                    # Execute tool call
-                    result = await self.session.call_tool(tool_name, tool_args)
-                    final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
-
-                    # Continue conversation with tool results
-                    if hasattr(content, 'text') and content.text:
+            while True:
+                # Get next action from Claude
+                response = self.anthropic.messages.create(
+                    model="claude-3-5-sonnet-20241022",
+                    max_tokens=1000,
+                    system=system_prompt,
+                    messages=messages,
+                    tools=available_tools
+                )
+                
+                has_tool_call = False
+                for content in response.content:
+                    if content.type == 'text':
+                        final_text.append(content.text)
+                    elif content.type == 'tool_use':
+                        has_tool_call = True
+                        tool_name = content.name
+                        tool_args = content.input
+                        
+                        # Execute action
+                        result = await self.session.call_tool(tool_name, tool_args)
+                        
+                        # Get current state for verification
+                        state = await self.session.call_tool('browser_snapshot', {})
+                        
+                        # Format the state information
+                        state_text = str(state.content[0].text) if state.content else "No state available"
+                        
+                        # Log the ReAct cycle
+                        final_text.append(f"\nTHINK: Current step - {tool_name}")
+                        final_text.append(f"ACT: Executing {tool_name} with parameters: {tool_args}")
+                        final_text.append(f"OBSERVE: Result: {result.content}")
+                        final_text.append(f"STATE: Current page state:\n{state_text}")
+                        
+                        # Continue conversation with results
                         messages.append({
                             "role": "assistant",
-                            "content": content.text
+                            "content": f"""
+THINK: I executed {tool_name}
+ACT: Action completed with parameters {tool_args}
+OBSERVE: 
+- Action Result: {result.content}
+- Current Page State: {state_text}
+NEXT: Let me analyze the results and determine the next step."""
                         })
+                        messages.append({
+                            "role": "user",
+                            "content": """Based on the current state:
+1. Was the last action successful?
+2. What is the next step in our test sequence?
+3. What specific action should we take next?
+
+Please respond in ReAct format and execute the next action."""
+                        })
+                        break
+                
+                if not has_tool_call:
+                    # Check if we're done or if Claude needs prompting
+                    if "test completed" in response.content[0].text.lower():
+                        break
                     messages.append({
                         "role": "user",
-                        "content": result.content
+                        "content": """What is the next action we need to take? Please analyze and respond in ReAct format:
+THINK: [Analyze current state and next required step]
+ACT: [Specify the next action needed]
+OBSERVE: [What should we verify]
+NEXT: [Execute the action]"""
                     })
-                    
-                    # Get next response from Claude
-                    response = self.anthropic.messages.create(
-                        model="claude-3-5-sonnet-20241022",
-                        max_tokens=1000,
-                        messages=messages,
-                    )
-                    final_text.append(response.content[0].text)
             
             return "\n".join(final_text)
         except Exception as e:
